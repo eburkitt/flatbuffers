@@ -410,7 +410,8 @@ void ParseAndGenerateTextTest() {
   // to ensure it is correct, we now generate text back from the binary,
   // and compare the two:
   std::string jsongen;
-  GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  auto result = GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  TEST_EQ(result, true);
 
   if (jsongen != jsonfile) {
     printf("%s----------------\n%s", jsongen.c_str(), jsonfile.c_str());
@@ -432,7 +433,7 @@ void ReflectionTest(uint8_t *flatbuf, size_t length) {
   // Make sure the schema is what we expect it to be.
   auto &schema = *reflection::GetSchema(bfbsfile.c_str());
   auto root_table = schema.root_table();
-  TEST_EQ_STR(root_table->name()->c_str(), "Monster");
+  TEST_EQ_STR(root_table->name()->c_str(), "MyGame.Example.Monster");
   auto fields = root_table->fields();
   auto hp_field_ptr = fields->LookupByKey("hp");
   TEST_NOTNULL(hp_field_ptr);
@@ -444,6 +445,14 @@ void ReflectionTest(uint8_t *flatbuf, size_t length) {
   TEST_NOTNULL(friendly_field_ptr);
   TEST_NOTNULL(friendly_field_ptr->attributes());
   TEST_NOTNULL(friendly_field_ptr->attributes()->LookupByKey("priority"));
+
+  // Make sure the table index is what we expect it to be.
+  auto pos_field_ptr = fields->LookupByKey("pos");
+  TEST_NOTNULL(pos_field_ptr);
+  TEST_EQ(pos_field_ptr->type()->base_type(), reflection::Obj);
+  auto pos_table_ptr = schema.objects()->Get(pos_field_ptr->type()->index());
+  TEST_NOTNULL(pos_table_ptr);
+  TEST_EQ_STR(pos_table_ptr->name()->c_str(), "MyGame.Example.Vec3");
 
   // Now use it to dynamically access a buffer.
   auto &root = *flatbuffers::GetAnyRoot(flatbuf);
@@ -827,7 +836,8 @@ void FuzzTest2() {
 
   std::string jsongen;
   parser.opts.indent_step = 0;
-  GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  auto result = GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  TEST_EQ(result, true);
 
   if (jsongen != json) {
     // These strings are larger than a megabyte, so we show the bytes around
@@ -978,15 +988,55 @@ void IntegerOutOfRangeTest() {
 
 void UnicodeTest() {
   flatbuffers::Parser parser;
+  // Without setting allow_non_utf8 = true, we treat \x sequences as byte sequences
+  // which are then validated as UTF-8.
   TEST_EQ(parser.Parse("table T { F:string; }"
                        "root_type T;"
                        "{ F:\"\\u20AC\\u00A2\\u30E6\\u30FC\\u30B6\\u30FC"
-                       "\\u5225\\u30B5\\u30A4\\u30C8\\x01\\x80\" }"), true);
+                       "\\u5225\\u30B5\\u30A4\\u30C8\\xE2\\x82\\xAC\\u0080\\uD83D\\uDE0E\" }"),
+          true);
   std::string jsongen;
   parser.opts.indent_step = -1;
-  GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
-  TEST_EQ(jsongen == "{F: \"\\u20AC\\u00A2\\u30E6\\u30FC\\u30B6\\u30FC"
-                     "\\u5225\\u30B5\\u30A4\\u30C8\\x01\\x80\"}", true);
+  auto result = GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  TEST_EQ(result, true);
+  TEST_EQ(jsongen,
+          std::string(
+            "{F: \"\\u20AC\\u00A2\\u30E6\\u30FC\\u30B6\\u30FC"
+            "\\u5225\\u30B5\\u30A4\\u30C8\\u20AC\\u0080\\uD83D\\uDE0E\"}"));
+}
+
+void UnicodeTestAllowNonUTF8() {
+  flatbuffers::Parser parser;
+  parser.opts.allow_non_utf8 = true;
+  TEST_EQ(parser.Parse("table T { F:string; }"
+                       "root_type T;"
+                       "{ F:\"\\u20AC\\u00A2\\u30E6\\u30FC\\u30B6\\u30FC"
+                       "\\u5225\\u30B5\\u30A4\\u30C8\\x01\\x80\\u0080\\uD83D\\uDE0E\" }"), true);
+  std::string jsongen;
+  parser.opts.indent_step = -1;
+  auto result = GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  TEST_EQ(result, true);
+  TEST_EQ(jsongen,
+          std::string(
+            "{F: \"\\u20AC\\u00A2\\u30E6\\u30FC\\u30B6\\u30FC"
+            "\\u5225\\u30B5\\u30A4\\u30C8\\u0001\\x80\\u0080\\uD83D\\uDE0E\"}"));
+}
+
+void UnicodeTestGenerateTextFailsOnNonUTF8() {
+  flatbuffers::Parser parser;
+  // Allow non-UTF-8 initially to model what happens when we load a binary flatbuffer from disk
+  // which contains non-UTF-8 strings.
+  parser.opts.allow_non_utf8 = true;
+  TEST_EQ(parser.Parse("table T { F:string; }"
+                       "root_type T;"
+                       "{ F:\"\\u20AC\\u00A2\\u30E6\\u30FC\\u30B6\\u30FC"
+                       "\\u5225\\u30B5\\u30A4\\u30C8\\x01\\x80\\u0080\\uD83D\\uDE0E\" }"), true);
+  std::string jsongen;
+  parser.opts.indent_step = -1;
+  // Now, disallow non-UTF-8 (the default behavior) so GenerateText indicates failure.
+  parser.opts.allow_non_utf8 = false;
+  auto result = GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  TEST_EQ(result, false);
 }
 
 void UnicodeSurrogatesTest() {
@@ -1027,6 +1077,96 @@ void UnicodeInvalidSurrogatesTest() {
     "{ F:\"\\uDC00\"}", "unpaired low surrogate");
 }
 
+void InvalidUTF8Test() {
+  // "1 byte" pattern, under min length of 2 bytes
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\x80\"}", "illegal UTF-8 sequence");
+  // 2 byte pattern, string too short
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xDF\"}", "illegal UTF-8 sequence");
+  // 3 byte pattern, string too short
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xEF\xBF\"}", "illegal UTF-8 sequence");
+  // 4 byte pattern, string too short
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xF7\xBF\xBF\"}", "illegal UTF-8 sequence");
+  // "5 byte" pattern, string too short
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xFB\xBF\xBF\xBF\"}", "illegal UTF-8 sequence");
+  // "6 byte" pattern, string too short
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xFD\xBF\xBF\xBF\xBF\"}", "illegal UTF-8 sequence");
+  // "7 byte" pattern, string too short
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xFE\xBF\xBF\xBF\xBF\xBF\"}", "illegal UTF-8 sequence");
+  // "5 byte" pattern, over max length of 4 bytes
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xFB\xBF\xBF\xBF\xBF\"}", "illegal UTF-8 sequence");
+  // "6 byte" pattern, over max length of 4 bytes
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xFD\xBF\xBF\xBF\xBF\xBF\"}", "illegal UTF-8 sequence");
+  // "7 byte" pattern, over max length of 4 bytes
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xFE\xBF\xBF\xBF\xBF\xBF\xBF\"}", "illegal UTF-8 sequence");
+
+  // Three invalid encodings for U+000A (\n, aka NEWLINE)
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xC0\x8A\"}", "illegal UTF-8 sequence");
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xE0\x80\x8A\"}", "illegal UTF-8 sequence");
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xF0\x80\x80\x8A\"}", "illegal UTF-8 sequence");
+
+  // Two invalid encodings for U+00A9 (COPYRIGHT SYMBOL)
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xE0\x81\xA9\"}", "illegal UTF-8 sequence");
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xF0\x80\x81\xA9\"}", "illegal UTF-8 sequence");
+
+  // Invalid encoding for U+20AC (EURO SYMBOL)
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    "{ F:\"\xF0\x82\x82\xAC\"}", "illegal UTF-8 sequence");
+
+  // UTF-16 surrogate values between U+D800 and U+DFFF cannot be encoded in UTF-8
+  TestError(
+    "table T { F:string; }"
+    "root_type T;"
+    // U+10400 "encoded" as U+D801 U+DC00
+    "{ F:\"\xED\xA0\x81\xED\xB0\x80\"}", "illegal UTF-8 sequence");
+}
+
 void UnknownFieldsTest() {
   flatbuffers::IDLOptions opts;
   opts.skip_unexpected_fields_in_json = true;
@@ -1046,7 +1186,8 @@ void UnknownFieldsTest() {
 
   std::string jsongen;
   parser.opts.indent_step = -1;
-  GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  auto result = GenerateText(parser, parser.builder_.GetBufferPointer(), &jsongen);
+  TEST_EQ(result, true);
   TEST_EQ(jsongen == "{str: \"test\",i: 10}", true);
 }
 
@@ -1058,6 +1199,11 @@ void ParseUnionTest() {
                        "table V { X:U; }"
                        "root_type V;"
                        "{ X:{ A:1 }, X_type: T }"), true);
+  // Unions must be parsable with prefixed namespace.
+  flatbuffers::Parser parser2;
+  TEST_EQ(parser2.Parse("namespace N; table A {} namespace; union U { N.A }"
+                        "table B { e:U; } root_type B;"
+                        "{ e_type: N_A, e: {} }"), true);
 }
 
 void ConformTest() {
@@ -1105,8 +1251,11 @@ int main(int /*argc*/, const char * /*argv*/[]) {
   EnumStringsTest();
   IntegerOutOfRangeTest();
   UnicodeTest();
+  UnicodeTestAllowNonUTF8();
+  UnicodeTestGenerateTextFailsOnNonUTF8();
   UnicodeSurrogatesTest();
   UnicodeInvalidSurrogatesTest();
+  InvalidUTF8Test();
   UnknownFieldsTest();
   ParseUnionTest();
   ConformTest();

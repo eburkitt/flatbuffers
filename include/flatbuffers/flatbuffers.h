@@ -151,39 +151,43 @@ inline void EndianCheck() {
   (void)endiantest;
 }
 
+template<typename T> T EndianSwap(T t) {
+  #if defined(_MSC_VER)
+    #define FLATBUFFERS_BYTESWAP16 _byteswap_ushort
+    #define FLATBUFFERS_BYTESWAP32 _byteswap_ulong
+    #define FLATBUFFERS_BYTESWAP64 _byteswap_uint64
+  #else
+    #if defined(__GNUC__) && __GNUC__ * 100 + __GNUC_MINOR__ < 408
+      // __builtin_bswap16 was missing prior to GCC 4.8.
+      #define FLATBUFFERS_BYTESWAP16(x) \
+        static_cast<uint16_t>(__builtin_bswap32(static_cast<uint32_t>(x) << 16))
+    #else
+      #define FLATBUFFERS_BYTESWAP16 __builtin_bswap16
+    #endif
+    #define FLATBUFFERS_BYTESWAP32 __builtin_bswap32
+    #define FLATBUFFERS_BYTESWAP64 __builtin_bswap64
+  #endif
+  if (sizeof(T) == 1) {   // Compile-time if-then's.
+    return t;
+  } else if (sizeof(T) == 2) {
+    auto r = FLATBUFFERS_BYTESWAP16(*reinterpret_cast<uint16_t *>(&t));
+    return *reinterpret_cast<T *>(&r);
+  } else if (sizeof(T) == 4) {
+    auto r = FLATBUFFERS_BYTESWAP32(*reinterpret_cast<uint32_t *>(&t));
+    return *reinterpret_cast<T *>(&r);
+  } else if (sizeof(T) == 8) {
+    auto r = FLATBUFFERS_BYTESWAP64(*reinterpret_cast<uint64_t *>(&t));
+    return *reinterpret_cast<T *>(&r);
+  } else {
+    assert(0);
+  }
+}
+
 template<typename T> T EndianScalar(T t) {
   #if FLATBUFFERS_LITTLEENDIAN
     return t;
   #else
-    #if defined(_MSC_VER)
-      #pragma push_macro("__builtin_bswap16")
-      #pragma push_macro("__builtin_bswap32")
-      #pragma push_macro("__builtin_bswap64")
-      #define __builtin_bswap16 _byteswap_ushort
-      #define __builtin_bswap32 _byteswap_ulong
-      #define __builtin_bswap64 _byteswap_uint64
-    #endif
-    // If you're on the few remaining big endian platforms, we make the bold
-    // assumption you're also on gcc/clang, and thus have bswap intrinsics:
-    if (sizeof(T) == 1) {   // Compile-time if-then's.
-      return t;
-    } else if (sizeof(T) == 2) {
-      auto r = __builtin_bswap16(*reinterpret_cast<uint16_t *>(&t));
-      return *reinterpret_cast<T *>(&r);
-    } else if (sizeof(T) == 4) {
-      auto r = __builtin_bswap32(*reinterpret_cast<uint32_t *>(&t));
-      return *reinterpret_cast<T *>(&r);
-    } else if (sizeof(T) == 8) {
-      auto r = __builtin_bswap64(*reinterpret_cast<uint64_t *>(&t));
-      return *reinterpret_cast<T *>(&r);
-    } else {
-      assert(0);
-    }
-    #if defined(_MSC_VER)
-      #pragma pop_macro("__builtin_bswap16")
-      #pragma pop_macro("__builtin_bswap32")
-      #pragma pop_macro("__builtin_bswap64")
-  #endif
+    return EndianSwap(t);
   #endif
 }
 
@@ -251,7 +255,7 @@ struct VectorIterator
 
 public:
   VectorIterator(const uint8_t *data, uoffset_t i) :
-      data_(data + IndirectHelper<T>::element_stride * i) {};
+      data_(data + IndirectHelper<T>::element_stride * i) {}
   VectorIterator(const VectorIterator &other) : data_(other.data_) {}
   #ifndef FLATBUFFERS_CPP98_STL
   VectorIterator(VectorIterator &&other) : data_(std::move(other.data_)) {}
@@ -356,7 +360,8 @@ public:
   void MutateOffset(uoffset_t i, const uint8_t *val) {
     assert(i < size());
     assert(sizeof(T) == sizeof(uoffset_t));
-    WriteScalar(data() + i, val - (Data() + i * sizeof(uoffset_t)));
+    WriteScalar(data() + i,
+                static_cast<uoffset_t>(val - (Data() + i * sizeof(uoffset_t))));
   }
 
   // Get a mutable pointer to tables/strings inside this vector.
@@ -1431,11 +1436,6 @@ class Struct FLATBUFFERS_FINAL_CLASS {
     return ReadScalar<T>(&data_[o]);
   }
 
-  template<typename T> T GetPointer(uoffset_t o) const {
-    auto p = &data_[o];
-    return reinterpret_cast<T>(p + ReadScalar<uoffset_t>(p));
-  }
-
   template<typename T> T GetStruct(uoffset_t o) const {
     return reinterpret_cast<T>(&data_[o]);
   }
@@ -1495,7 +1495,8 @@ class Table {
   bool SetPointer(voffset_t field, const uint8_t *val) {
     auto field_offset = GetOptionalFieldOffset(field);
     if (!field_offset) return false;
-    WriteScalar(data_ + field_offset, val - (data_ + field_offset));
+    WriteScalar(data_ + field_offset,
+                static_cast<uoffset_t>(val - (data_ + field_offset)));
     return true;
   }
 
